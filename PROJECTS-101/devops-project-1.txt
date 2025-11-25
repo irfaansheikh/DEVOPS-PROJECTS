@@ -1,0 +1,378 @@
+Project 1 — Dockerize a simple Node.js web app and deploy it with CI/CD
+
+Goal: Build a minimal Node.js app, containerize it with Docker, push the image to a registry, and wire up an automated pipeline to deploy the container to:
+
+AWS: ECR → ECS (Fargate) via GitHub Actions
+
+Azure: Azure Container Registry (ACR) → Azure Web App for Containers (or ACI) via GitHub Actions
+
+I’ll give both flows so you can show cloud-agnostic skills. Do steps in order.
+
+PREP: tools you need locally (install if not already)
+
+Git
+
+Docker Desktop (enable WSL2 backend or Linux containers)
+
+Node.js (LTS) and npm
+
+AWS CLI configured (aws configure) with a profile that has ECR/ECS permissions
+
+Azure CLI (az login) with access to a subscription (for Azure path)
+
+GitHub account and a repo for the project
+(If you need exact install commands for any of these, say which and I’ll drop them.)
+
+PART A — Create the sample Node.js app and Dockerize it
+
+Create project folder and app
+
+mkdir devops-project-1
+cd devops-project-1
+git init
+
+
+Create a simple Express app
+
+package.json
+
+{
+  "name": "simple-web",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"no tests\""
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
+
+
+index.js
+
+const express = require('express');
+const app = express();
+const port = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+  res.json({ message: "Hello from DevOps Project 1", env: process.env.NODE_ENV || 'dev' });
+});
+
+app.listen(port, () => console.log(`Listening on ${port}`));
+
+
+Install deps and confirm app runs
+
+npm install
+node index.js
+# open http://localhost:3000 in browser — should see JSON
+
+
+Add a simple .dockerignore
+
+node_modules
+npm-debug.log
+.git
+
+
+Create a Dockerfile
+
+FROM node:18-alpine
+
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+EXPOSE 3000
+CMD ["node", "index.js"]
+
+
+Build and run locally with Docker
+
+docker build -t simple-web:local .
+docker run -p 3000:3000 simple-web:local
+# verify http://localhost:3000
+
+
+Commit and push to GitHub
+
+git add .
+git commit -m "Initial simple web app + Dockerfile"
+# create remote repo on GitHub, then:
+git remote add origin git@github.com:YOURUSERNAME/devops-project-1.git
+git push -u origin main
+
+PART B — AWS: push image to ECR and deploy to ECS (Fargate) via GitHub Actions
+B1 — Prepare AWS resources (you can do via CLI or Console)
+
+Create ECR repository
+
+aws ecr create-repository --repository-name simple-web --region YOUR_REGION
+
+
+Note the repository URI returned: ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com/simple-web
+
+Create ECS cluster (Fargate)
+
+aws ecs create-cluster --cluster-name simple-web-cluster --region YOUR_REGION
+
+
+(We’ll create task definition & service via CloudFormation, Terraform, or GitHub Actions. For simplicity we’ll let GitHub Actions register a task definition at deploy time.)
+
+B2 — Create IAM permissions for GitHub Actions (recommended)
+
+Option A: Use GitHub OIDC provider and fine-grained role for GitHub Actions (recommended).
+Option B: Use an IAM user with programmatic keys (simpler but less secure).
+If you want step-by-step for GitHub OIDC role creation, tell me and I’ll provide it. For now I’ll show the simpler approach using an IAM user (you can upgrade later).
+
+Create IAM user with ECR & ECS permissions (console easier). Save AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+
+B3 — Add secrets to GitHub repo
+
+Go to your repo → Settings → Secrets → Actions:
+
+AWS_ACCESS_KEY_ID
+
+AWS_SECRET_ACCESS_KEY
+
+AWS_REGION (e.g., us-east-1)
+
+ECR_REGISTRY = ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com
+
+ECR_REPOSITORY = simple-web
+
+CLUSTER_NAME = simple-web-cluster
+
+SERVICE_NAME = simple-web-service (choose a name)
+
+TASK_FAMILY = simple-web-task
+
+B4 — GitHub Actions workflow (create .github/workflows/aws-deploy.yml)
+name: Build and Deploy to AWS ECS
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    env:
+      ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Build, tag, and push image to ECR
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::8}
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+
+      - name: Deploy to ECS (register task & update service)
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CLUSTER_NAME: ${{ secrets.CLUSTER_NAME }}
+          SERVICE_NAME: ${{ secrets.SERVICE_NAME }}
+          TASK_FAMILY: ${{ secrets.TASK_FAMILY }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::8}
+          CONTAINER_DEF=$(cat <<EOF
+  [
+    {
+      "name": "simple-web",
+      "image": "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG",
+      "essential": true,
+      "portMappings": [
+        { "containerPort": 3000, "protocol": "tcp" }
+      ],
+      "memory": 512,
+      "cpu": 256
+    }
+  ]
+EOF
+)
+          # Register task definition
+          aws ecs register-task-definition \
+            --family $TASK_FAMILY \
+            --network-mode awsvpc \
+            --requires-compatibilities FARGATE \
+            --cpu "256" --memory "512" \
+            --execution-role-arn arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole || true \
+            --container-definitions "$CONTAINER_DEF" \
+            --region $AWS_REGION
+
+          # Update or create service
+          SERVICE_EXISTS=$(aws ecs describe-services --cluster $CLUSTER_NAME --services $SERVICE_NAME --region $AWS_REGION --query 'services[0].status' --output text 2>/dev/null || echo "MISSING")
+          if [ "$SERVICE_EXISTS" = "MISSING" ] || [ "$SERVICE_EXISTS" = "None" ]; then
+            # Create service (substitute subnet/security-group ids if needed)
+            aws ecs create-service \
+              --cluster $CLUSTER_NAME \
+              --service-name $SERVICE_NAME \
+              --task-definition $TASK_FAMILY \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[subnet-xxxxxx],securityGroups=[sg-xxxxxx],assignPublicIp=ENABLED}" \
+              --region $AWS_REGION
+          else
+            aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --force-new-deployment --region $AWS_REGION
+          fi
+
+
+Notes & TODOs for the above
+
+You must create an ecsTaskExecutionRole (AWS managed policy AmazonECSTaskExecutionRolePolicy) and allow the GitHub runner to use it. If you don’t have AWS account id secret, add AWS_ACCOUNT_ID to GitHub secrets.
+
+Replace subnet-xxxxxx and sg-xxxxxx in the create-service step with your VPC subnet IDs and security group that allows HTTP traffic. Alternatively, create the service manually in the console the first time and then let the workflow only update the service.
+
+The workflow both pushes image and attempts to register/update a task definition and update service. It’s a simple single-file deploy pattern.
+
+B5 — Test it
+
+Push changes to main, check GitHub Actions logs for build/push/deploy steps.
+
+After deploy, locate the public endpoint (ECS service → associated ALB or public IP depending on networking). Hit the endpoint.
+
+PART C — Azure equivalent: push to ACR and deploy to Azure Web App for Containers via GitHub Actions
+C1 — Azure resources
+
+Create Resource Group, ACR, and Web App for Containers. Example CLI:
+
+az group create -n rg-devops-p1 -l eastus
+az acr create -n myacrname -g rg-devops-p1 --sku Basic
+az webapp create -g rg-devops-p1 -n mywebappname --plan MyAppServicePlan --deployment-container-image-name myacrname.azurecr.io/simple-web:latest
+
+
+(You may need to create App Service plan first and adjust names.)
+
+C2 — Login to ACR locally and push test
+az acr login --name myacrname
+IMAGE=myacrname.azurecr.io/simple-web:v1
+docker tag simple-web:local $IMAGE
+docker push $IMAGE
+
+C3 — Add GitHub secrets
+
+AZURE_WEBAPP_NAME = mywebappname
+
+AZURE_REGISTRY = myacrname.azurecr.io
+
+AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID (service principal) — or use azure/login action with az login via service principal secret
+
+AZURE_SUBSCRIPTION_ID
+
+Create a Service Principal (locally) and add to GitHub secrets:
+
+az ad sp create-for-rbac --name "gh-action-sp-devops1" --role contributor \
+  --scopes /subscriptions/YOUR_SUBSCRIPTION_ID/resourceGroups/rg-devops-p1 \
+  --sdk-auth
+
+
+Copy the returned JSON and store as AZURE_CREDENTIALS secret in GitHub (this is easiest — azure/login supports that JSON).
+
+C4 — GitHub Actions workflow for Azure (.github/workflows/azure-deploy.yml)
+name: Build and Deploy to Azure Web App for Containers
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ secrets.AZURE_REGISTRY }}
+          login-username: ${{ secrets.AZURE_REGISTRY_USERNAME }} # optional if using AZURE_CREDENTIALS
+          login-password: ${{ secrets.AZURE_REGISTRY_PASSWORD }}
+
+      - name: Build and push image to ACR
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::8}
+          docker build -t ${{ secrets.AZURE_REGISTRY }}/simple-web:$IMAGE_TAG .
+          docker push ${{ secrets.AZURE_REGISTRY }}/simple-web:$IMAGE_TAG
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ secrets.AZURE_WEBAPP_NAME }}
+          images: ${{ secrets.AZURE_REGISTRY }}/simple-web:${{ github.sha::8 }}
+
+
+Alternative: Use azure/login with AZURE_CREDENTIALS and then use az webapp config container set to point the web app to the new image.
+
+C5 — Test it
+
+Push to main, watch GitHub Actions. Visit https://mywebappname.azurewebsites.net.
+
+PART D — What to record in your CV/GitHub README for Project 1
+
+Add a README with:
+
+Short summary: what the app does.
+
+Architecture diagram (simple ASCII or image): GitHub Actions → Registry → ECS (Fargate) or ACR → Web App
+
+Files to highlight: Dockerfile, .github/workflows/aws-deploy.yml, .github/workflows/azure-deploy.yml
+
+Commands to reproduce locally: docker build, docker run, push instructions
+
+Challenges & what you learned (networking, IAM, task definitions, app settings, secrets management)
+
+Example bullet for CV:
+
+Built and containerized a Node.js microservice, implemented automated CI/CD using GitHub Actions to push Docker images to AWS ECR and deploy to AWS ECS (Fargate). Implemented parallel Azure pipeline using ACR and Azure Web App for Containers. Managed secrets with GitHub Secrets and validated deployments with health checks and logs.
+
+Troubleshooting & tips
+
+If GitHub Action fails logging into ECR, double-check AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, region, and that the IAM user has ecr:*, ecs:*, iam:PassRole permissions (for task execution role).
+
+For AWS networking, if your service lacks public internet, create an ALB or configure assignPublicIp on the Fargate task.
+
+For Azure, the azure/webapps-deploy action expects the image to be in a registry it can reach; ensure ACR and Web App are in same subscription or accessible.
+
+Start with manual deploy via console first (push to registry, create task/service in ECS or set web app container) to confirm the image works, then automate.
+
+When you finish this project, reply “done project 1” and I’ll give you Project 2 next — step-by-step, same style. If you want, I can also:
+
+Provide an exact IAM policy JSON for GitHub Actions,
+
+Provide Terraform/CloudFormation to create the AWS resources,
+
+Provide the azure/login + service principal creation steps in full.
+
+Tell me which extra bits you want with Project 1 (or just say “done” and I’ll move to Project 2).
